@@ -1,3 +1,21 @@
 .env
 launch.ps1
 .claude/
+
+# Dependencies
+node_modules/
+
+# Hardhat
+cache/
+artifacts/
+typechain-types/
+
+# Build
+dist/
+
+# Database
+data/*.db
+data/test_*.db
+
+# Deploy output
+deployed_addresses.json
