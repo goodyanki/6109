@@ -90,6 +90,16 @@ describe("BatchExecutor", function () {
         .approve(await intentManager.getAddress(), ethers.MaxUint256);
     }
 
+    // Approve BatchExecutor for agent1 and agent3 (agent2 intentionally excluded for BE-019)
+    for (const agent of [agent1, agent3]) {
+      await usdc
+        .connect(agent)
+        .approve(await batchExecutor.getAddress(), ethers.MaxUint256);
+      await weth
+        .connect(agent)
+        .approve(await batchExecutor.getAddress(), ethers.MaxUint256);
+    }
+
     return {
       batchExecutor,
       intentManager,
@@ -329,7 +339,8 @@ describe("BatchExecutor", function () {
       const { batchExecutor, intentManager, relayer, agent1, usdc, weth } =
         await loadFixture(deployFixture);
 
-      const deadline = Math.floor(Date.now() / 1000) + 2; // 2 seconds from now
+      const latest = await time.latest();
+      const deadline = latest + 2;
       await intentManager
         .connect(agent1)
         .submitSwapIntent(
@@ -398,7 +409,7 @@ describe("BatchExecutor", function () {
       }
 
       // 2 intents with soon-expiring deadline from agent2
-      const nearDeadline = Math.floor(Date.now() / 1000) + 2;
+      const nearDeadline = (await time.latest()) + 60;
       for (let i = 0; i < 2; i++) {
         await intentManager
           .connect(agent2)
@@ -418,7 +429,7 @@ describe("BatchExecutor", function () {
       await registry.setAgentStatus(3, false);
 
       // Advance time past nearDeadline
-      await time.increase(5);
+      await time.increase(65);
 
       // Execute all 10
       const tx = await batchExecutor
@@ -427,10 +438,10 @@ describe("BatchExecutor", function () {
       const receipt = await tx.wait();
 
       // Parse BatchExecuted event
+      const beAddress = await batchExecutor.getAddress();
       const events = receipt?.logs
         .filter(
-          (log: { address: string }) =>
-            log.address === (await batchExecutor.getAddress())
+          (log: { address: string }) => log.address === beAddress
         )
         .map((log: { topics: string[]; data: string }) => {
           try {
@@ -453,7 +464,7 @@ describe("BatchExecutor", function () {
       const { batchExecutor, intentManager, relayer, agent1, usdc, weth } =
         await loadFixture(deployFixture);
 
-      const nearDeadline = Math.floor(Date.now() / 1000) + 2;
+      const nearDeadline = (await time.latest()) + 120;
       for (let i = 0; i < 10; i++) {
         await intentManager
           .connect(agent1)
@@ -468,7 +479,7 @@ describe("BatchExecutor", function () {
           );
       }
 
-      await time.increase(5);
+      await time.increase(125);
 
       // Should NOT revert — all expired
       await expect(
@@ -518,8 +529,8 @@ describe("BatchExecutor", function () {
       let failedCount = 0;
       for (let i = 1; i <= 10; i++) {
         const intent = await intentManager.getIntent(i);
-        if (intent.status === 2) executedCount++; // EXECUTED
-        if (intent.status === 3) failedCount++; // FAILED
+        if (Number(intent.status) === 2) executedCount++; // EXECUTED
+        if (Number(intent.status) === 3) failedCount++; // FAILED
       }
       expect(executedCount).to.equal(9);
       expect(failedCount).to.equal(1);
@@ -661,9 +672,9 @@ describe("BatchExecutor", function () {
       const receipt = await tx.wait();
 
       // Look for IntentExecuted events from IntentManager
+      const imAddress = await intentManager.getAddress();
       const imEvents = receipt?.logs.filter(
-        (log: { address: string }) =>
-          log.address === (await intentManager.getAddress())
+        (log: { address: string }) => log.address === imAddress
       );
       expect(imEvents).to.not.be.null;
     });
@@ -673,7 +684,7 @@ describe("BatchExecutor", function () {
         await loadFixture(deployFixture);
 
       // Submit 2, make one expired
-      const nearDeadline = Math.floor(Date.now() / 1000) + 2;
+      const nearDeadline = (await time.latest()) + 2;
       await intentManager
         .connect(agent1)
         .submitSwapIntent(
