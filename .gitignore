@@ -9,6 +9,8 @@ node_modules/
 cache/
 artifacts/
 typechain-types/
+.hardhat-home/
+.hardhat-config/
 
 # Build
 dist/
