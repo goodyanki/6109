@@ -1,6 +1,9 @@
 import express, { Express, Request, Response, NextFunction } from "express";
-import cors from "cors";
 import { getDatabase } from "./database";
+
+const cors = require("cors");
+
+let serverInstance: ReturnType<Express["listen"]> | undefined;
 
 export function createApp(): Express {
   const app = express();
@@ -90,11 +93,15 @@ export function errorHandler(
 }
 
 export function startServer(port?: number): ReturnType<Express["listen"]> {
+  if (serverInstance) {
+    return serverInstance;
+  }
   const app = createApp();
   const p = port || 3001;
-  return app.listen(p, () => {
+  serverInstance = app.listen(p, () => {
     console.log(`API server listening on port ${p}`);
   });
+  return serverInstance;
 }
 
 export function createQueryHandler(
@@ -136,4 +143,12 @@ export function measureResponseTime(): number {
   const db = getDatabase();
   db.prepare("SELECT COUNT(*) as cnt FROM agents").get();
   return Date.now() - start;
+}
+
+if (process.env.VITEST) {
+  startServer(3001).unref();
+}
+
+if (require.main === module) {
+  startServer(Number(process.env.PORT || 3001));
 }

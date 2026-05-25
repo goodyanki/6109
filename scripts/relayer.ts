@@ -1,6 +1,11 @@
 import { ethers } from "ethers";
+import * as fs from "fs";
+import * as path from "path";
+import { getDatabase } from "./database";
+import { DEFAULT_HARDHAT_PRIVATE_KEY, DEFAULT_RPC_URL, DeployedAddresses } from "./deploy";
 
 export const DEFAULT_POLL_INTERVAL_MS = 10000;
+export const STATUS_NAMES = ["PENDING", "BATCHED", "EXECUTED", "FAILED", "EXPIRED", "CANCELLED"];
 
 export interface Intent {
   id: number;
@@ -19,7 +24,9 @@ export interface RelayerConfig {
   privateKey?: string;
   pollIntervalMs?: number;
   maxBatchSize?: number;
-  contractAddresses?: Record<string, string>;
+  contractAddresses?: DeployedAddresses;
+  once?: boolean;
+  dbPath?: string;
 }
 
 export interface BatchRecord {
@@ -40,6 +47,27 @@ export function createRelayer(config: RelayerConfig) {
     pollIntervalMs,
     maxBatchSize,
   };
+}
+
+function readJson(filePath: string): any {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function readArtifact(contractName: string): { abi: ethers.InterfaceAbi } {
+  return readJson(
+    path.join(
+      __dirname,
+      "..",
+      "artifacts",
+      "contracts",
+      `${contractName}.sol`,
+      `${contractName}.json`
+    )
+  );
+}
+
+export function readDeployedAddresses(filePath?: string): DeployedAddresses {
+  return readJson(filePath || path.join(__dirname, "..", "data", "deployed_addresses.json"));
 }
 
 export function shouldSkipCycle(intents: Array<{ id: number }>): boolean {
@@ -68,6 +96,21 @@ export function groupIntoBatches(
   for (let i = 0; i < intents.length; i += maxBatchSize) {
     batches.push(intents.slice(i, i + maxBatchSize).map((it) => it.id));
   }
+  return batches;
+}
+
+export function buildCompatibleBatches(
+  intents: Array<{ id: number; intentType: number; tokenIn?: string; tokenOut?: string }>,
+  maxBatchSize: number
+): number[][] {
+  const groups = groupIntentsByType(intents);
+  const batches: number[][] = [];
+
+  for (const swaps of Object.values(groupSwapsByPair(groups.SWAP as any))) {
+    batches.push(...groupIntoBatches(swaps, maxBatchSize));
+  }
+
+  batches.push(...groupIntoBatches(groups.TRANSFER, maxBatchSize));
   return batches;
 }
 
@@ -104,12 +147,41 @@ export function recordBatch(batch: BatchRecord): BatchRecord {
   return batch;
 }
 
+export function insertBatchRecord(batch: BatchRecord, dbPath?: string): void {
+  const db = getDatabase(dbPath);
+  db.prepare(
+    `INSERT INTO batches (tx_hash, batch_size, intent_count, success_count, failed_count, gas_used)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(
+    batch.txHash,
+    batch.batchSize,
+    batch.intentCount,
+    batch.successCount,
+    batch.failedCount,
+    batch.gasUsed
+  );
+}
+
 export function updateIntentStatus(
   intentId: number,
   status: string,
   txHash: string
 ): { intentId: number; status: string; txHash: string } {
   return { intentId, status, txHash };
+}
+
+export function updateIntentStatusInDb(
+  intentId: number,
+  status: string,
+  txHash: string,
+  dbPath?: string
+): void {
+  const db = getDatabase(dbPath);
+  db.prepare(
+    `UPDATE intents
+     SET status = ?, tx_hash = ?, executed_at = datetime('now')
+     WHERE chain_intent_id = ?`
+  ).run(status, txHash, intentId);
 }
 
 export function calculateLatencyMs(createdAt: number, executedAt: number): number {
@@ -119,4 +191,119 @@ export function calculateLatencyMs(createdAt: number, executedAt: number): numbe
 export function calculateGasPerIntent(totalGas: number, intentCount: number): number {
   if (intentCount === 0) return 0;
   return totalGas / intentCount;
+}
+
+async function loadPendingIntents(
+  intentManager: ethers.Contract,
+  registry: ethers.Contract,
+  currentGasPrice: bigint
+): Promise<Intent[]> {
+  const ids = (await intentManager.getPendingIntentIds(0, 1000)) as bigint[];
+  const intents: Intent[] = [];
+  for (const rawId of ids) {
+    const id = Number(rawId);
+    const chainIntent = await intentManager.getIntent(id);
+    const agentActive = await registry.isAgentActive(chainIntent.agent);
+    intents.push({
+      id,
+      status: Number(chainIntent.status),
+      executeAfter: BigInt(chainIntent.executeAfter),
+      deadline: BigInt(chainIntent.deadline),
+      agentActive,
+      maxGasPrice: BigInt(chainIntent.maxGasPrice),
+      intentType: Number(chainIntent.intentType),
+      tokenIn: chainIntent.tokenIn,
+      tokenOut: chainIntent.tokenOut,
+    });
+  }
+  return intents.filter((intent) => intent.status === 0 && isExecutable(intent, currentGasPrice));
+}
+
+function parseBatchEvent(
+  receipt: ethers.TransactionReceipt,
+  batchExecutor: ethers.Contract
+): { successCount: number; failedCount: number } {
+  for (const log of receipt.logs) {
+    try {
+      const parsed = batchExecutor.interface.parseLog(log);
+      if (parsed?.name === "BatchExecuted") {
+        return {
+          successCount: Number(parsed.args.successCount),
+          failedCount: Number(parsed.args.failedCount),
+        };
+      }
+    } catch {
+      // Ignore logs emitted by other contracts.
+    }
+  }
+  return { successCount: 0, failedCount: 0 };
+}
+
+export async function runRelayerCycle(config: RelayerConfig): Promise<BatchRecord[]> {
+  const addresses = (config.contractAddresses || readDeployedAddresses()) as DeployedAddresses;
+  const provider = new ethers.JsonRpcProvider(config.rpcUrl || DEFAULT_RPC_URL);
+  const wallet = new ethers.Wallet(
+    config.privateKey || process.env.RELAYER_PRIVATE_KEY || process.env.PRIVATE_KEY || DEFAULT_HARDHAT_PRIVATE_KEY,
+    provider
+  );
+  const signer = new ethers.NonceManager(wallet);
+
+  const intentArtifact = readArtifact("IntentManager");
+  const registryArtifact = readArtifact("AgentRegistry");
+  const batchArtifact = readArtifact("BatchExecutor");
+  const intentManager = new ethers.Contract(addresses.intentManager, intentArtifact.abi, signer);
+  const registry = new ethers.Contract(addresses.agentRegistry, registryArtifact.abi, signer);
+  const batchExecutor = new ethers.Contract(addresses.batchExecutor, batchArtifact.abi, signer);
+
+  const feeData = await provider.getFeeData();
+  const currentGasPrice = feeData.gasPrice || 0n;
+  const executable = await loadPendingIntents(intentManager, registry, currentGasPrice);
+  if (shouldSkipCycle(executable)) {
+    console.log("No pending intents");
+    return [];
+  }
+
+  const batches = buildCompatibleBatches(executable as Required<Intent>[], config.maxBatchSize || 10);
+  const records: BatchRecord[] = [];
+  for (const batch of batches) {
+    const receipt = await submitBatchAndWait(batchExecutor, batch);
+    const counts = parseBatchEvent(receipt, batchExecutor);
+    const record = {
+      txHash: receipt.hash,
+      batchSize: batch.length,
+      intentCount: batch.length,
+      successCount: counts.successCount,
+      failedCount: counts.failedCount,
+      gasUsed: Number(receipt.gasUsed),
+    };
+    insertBatchRecord(record, config.dbPath);
+    for (const id of batch) {
+      const updated = await intentManager.getIntent(id);
+      updateIntentStatusInDb(id, STATUS_NAMES[Number(updated.status)] || "UNKNOWN", receipt.hash, config.dbPath);
+    }
+    records.push(recordBatch(record));
+  }
+  return records;
+}
+
+export async function runRelayer(config: RelayerConfig): Promise<void> {
+  const relayer = createRelayer(config);
+  do {
+    await runRelayerCycle(config);
+    if (config.once) break;
+    await new Promise((resolve) => setTimeout(resolve, relayer.pollIntervalMs));
+  } while (true);
+}
+
+if (require.main === module) {
+  runRelayer({
+    rpcUrl: process.env.RPC_URL || DEFAULT_RPC_URL,
+    privateKey: process.env.RELAYER_PRIVATE_KEY || process.env.PRIVATE_KEY || DEFAULT_HARDHAT_PRIVATE_KEY,
+    pollIntervalMs: Number(process.env.POLL_INTERVAL_MS || DEFAULT_POLL_INTERVAL_MS),
+    maxBatchSize: Number(process.env.MAX_BATCH_SIZE || 10),
+    once: process.env.RELAYER_ONCE === "1",
+  }).catch((err) => {
+    console.error(err);
+    process.exitCode = 1;
+  });
 }

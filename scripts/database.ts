@@ -2,10 +2,18 @@ import Database from "better-sqlite3";
 import * as path from "path";
 import * as fs from "fs";
 
-export const DB_PATH = path.join(__dirname, "..", "data", "metrics.db");
+export const DB_PATH =
+  process.env.METRICS_DB_PATH || path.join(__dirname, "..", "data", "metrics.db");
+
+const openConnections = new Map<string, Database.Database>();
 
 export function initializeDatabase(dbPath?: string): Database.Database {
   const resolvedPath = dbPath || DB_PATH;
+  const existing = openConnections.get(resolvedPath);
+  if (existing?.open) {
+    return existing;
+  }
+
   const dir = path.dirname(resolvedPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -70,13 +78,29 @@ export function initializeDatabase(dbPath?: string): Database.Database {
     )
   `);
 
+  openConnections.set(resolvedPath, db);
   return db;
 }
 
 export function getDatabase(dbPath?: string): Database.Database {
   const resolvedPath = dbPath || DB_PATH;
+  const existing = openConnections.get(resolvedPath);
+  if (existing?.open) {
+    return existing;
+  }
   if (!fs.existsSync(resolvedPath)) {
     return initializeDatabase(resolvedPath);
   }
-  return new Database(resolvedPath);
+  const db = new Database(resolvedPath);
+  openConnections.set(resolvedPath, db);
+  return db;
+}
+
+export function closeDatabase(dbPath?: string): void {
+  const resolvedPath = dbPath || DB_PATH;
+  const existing = openConnections.get(resolvedPath);
+  if (existing?.open) {
+    existing.close();
+  }
+  openConnections.delete(resolvedPath);
 }
